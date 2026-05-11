@@ -32,23 +32,30 @@ import pandas as pd
 import numpy as np
 
 try:
-    from selenium import webdriver
-    from selenium.webdriver.chrome.options  import Options
-    from selenium.webdriver.chrome.service  import Service
-    from selenium.webdriver.common.by       import By
-    from selenium.webdriver.support.ui      import WebDriverWait
-    from selenium.webdriver.support         import expected_conditions as EC
-    from selenium.common.exceptions         import TimeoutException, WebDriverException
-    SELENIUM_OK = True
-except ImportError:
-    SELENIUM_OK = False
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from webdriver_manager.chrome import ChromeDriverManager
 
-try:
-    from webdriver_manager.chrome import ChromeDriverManager
-    USE_WDM = True
-except ImportError:
-    USE_WDM = False
+def get_chrome_driver():
+    """
+    Returns a headless Chrome WebDriver that works both locally
+    and on GitHub Actions (Ubuntu, no display).
+    """
+    options = Options()
+    options.add_argument("--headless=new")          # new headless mode (Chrome 112+)
+    options.add_argument("--no-sandbox")             # required on Linux CI
+    options.add_argument("--disable-dev-shm-usage")  # overcomes /dev/shm size limit
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--disable-setuid-sandbox")
 
+    # webdriver-manager auto-downloads the matching ChromeDriver binary
+    service = Service(ChromeDriverManager().install())
+    driver  = webdriver.Chrome(service=service, options=options)
+    return driver
+          
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
