@@ -10,13 +10,20 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4.2.2
 
+      - name: Install Chrome
+        run: |
+          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
+          echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
+          sudo apt-get update -q
+          sudo apt-get install -y google-chrome-stable
+
       - name: Set up Python
         uses: actions/setup-python@v5.4.0
         with:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install yfinance pandas openpyxl matplotlib selenium
+        run: pip install yfinance pandas openpyxl matplotlib selenium webdriver-manager
 
       - name: Run chart generator
         run: python MC_10Cr_Above_D.py
@@ -26,20 +33,21 @@ jobs:
           echo "=== Current directory ==="
           ls -la
           echo "=== Charts folder ==="
-          ls -la YF_D_500/ || echo "YF_D_500/ folder does not exist!"
+          ls -la NSE_Filtered_Charts/ || echo "NSE_Filtered_Charts/ folder does not exist!"
 
       - name: Zip charts folder
         run: |
-          if [ -d "YF_D_500" ] && [ "$(ls -A YF_D_500)" ]; then
-            cd YF_D_500
-            ZIP_NAME="charts_NSE500_$(date +'%Y-%m-%d').zip"
+          FOLDER="NSE_Filtered_Charts"
+          if [ -d "$FOLDER" ] && [ "$(ls -A $FOLDER)" ]; then
+            cd "$FOLDER"
+            ZIP_NAME="charts_NSE_10Cr_$(date +'%Y-%m-%d').zip"
             zip -j "../${ZIP_NAME}" *.png
             cd ..
             echo "ZIP_NAME=${ZIP_NAME}" >> $GITHUB_ENV
             echo "Created: ${ZIP_NAME}"
             ls -lh "${ZIP_NAME}"
           else
-            echo "ERROR: YF_D_500 folder is empty or missing"
+            echo "ERROR: $FOLDER folder is empty or missing"
             ls -la
             exit 1
           fi
@@ -47,8 +55,8 @@ jobs:
       - name: Create GitHub Release with charts
         uses: softprops/action-gh-release@v2.2.1
         with:
-          tag_name: charts-NSE500-${{ github.run_number }}
-          name: "NSE 500 - ${{ github.run_number }}"
+          tag_name: charts-NSE-10Cr-${{ github.run_number }}
+          name: "NSE 10Cr Filter - Run ${{ github.run_number }}"
           files: ${{ env.ZIP_NAME }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
