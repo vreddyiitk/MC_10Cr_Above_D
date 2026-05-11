@@ -1,61 +1,50 @@
 """
-nse_pipeline.py
-===============
+nse_pipeline.py  /  MC_10Cr_Above_D.py
+=======================================
 STEP 1 — Download live "Stocks Traded" data from NSE India
-          https://www.nseindia.com/market-data/stocks-traded
-
 STEP 2 — Filter EQ-series stocks where Value > ₹10 Crores
-
 STEP 3 — Download 250 daily bars from yfinance and save
-          TradingView-style dark-theme PNG charts (Candlestick + EMA9 + MACD)
-
-NSE CSV exact columns (confirmed from live download):
-    Symbol | Series | LTP | %chng | Mkt Cap (₹ Crores) | Volume (Lakhs) | Value (₹ Crores)
-
-NSE JSON API fields (confirmed from live XHR):
-    symbol | series | lastPrice | pChange | totalTradedVolume | totalTradedValue (raw ₹)
+          TradingView-style dark-theme PNG charts
 
 Requirements:
     pip install selenium webdriver-manager yfinance pandas openpyxl matplotlib
 
 Usage:
-    python nse_pipeline.py                      # visible browser
-    python nse_pipeline.py --headless           # headless Chrome
-    python nse_pipeline.py --from-csv  StocksTraded.csv
+    python MC_10Cr_Above_D.py                   # headless (CI / GitHub Actions)
+    python MC_10Cr_Above_D.py --visible         # visible browser (local debug)
+    python MC_10Cr_Above_D.py --from-csv FILE   # skip browser
 """
 
-import sys, os, glob, json, time, shutil, datetime, tempfile
-import argparse, traceback, warnings
+import sys
+import os
+import glob
+import json
+import time
+import shutil
+import datetime
+import tempfile
+import argparse
+import traceback
+import warnings
 from datetime import timedelta
 
 import pandas as pd
 import numpy as np
 
+# ── Selenium (optional — graceful fallback if missing) ───────────────────────
 try:
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from webdriver_manager.chrome import ChromeDriverManager
+    from selenium import webdriver
+    from selenium.webdriver.chrome.service import Service
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.common.exceptions import TimeoutException, WebDriverException
+    from webdriver_manager.chrome import ChromeDriverManager
+    SELENIUM_OK = True
+except ImportError:
+    SELENIUM_OK = False
 
-def get_chrome_driver():
-    """
-    Returns a headless Chrome WebDriver that works both locally
-    and on GitHub Actions (Ubuntu, no display).
-    """
-    options = Options()
-    options.add_argument("--headless=new")          # new headless mode (Chrome 112+)
-    options.add_argument("--no-sandbox")             # required on Linux CI
-    options.add_argument("--disable-dev-shm-usage")  # overcomes /dev/shm size limit
-    options.add_argument("--disable-gpu")
-    options.add_argument("--disable-extensions")
-    options.add_argument("--window-size=1920,1080")
-    options.add_argument("--disable-setuid-sandbox")
-
-    # webdriver-manager auto-downloads the matching ChromeDriver binary
-    service = Service(ChromeDriverManager().install())
-    driver  = webdriver.Chrome(service=service, options=options)
-    return driver
-          
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -63,25 +52,26 @@ import matplotlib.patches as mpatches
 import matplotlib.gridspec as gridspec
 from matplotlib.lines import Line2D
 import yfinance as yf
+
 warnings.filterwarnings("ignore")
 
 
 # ═══════════════════════════════════════════════════════════════
-#  CONFIG  — edit these to change behaviour
+#  CONFIG
 # ═══════════════════════════════════════════════════════════════
 
-TRADED_VALUE_MIN_CR = 10      # Filter: keep stocks with Value > ₹ this many Cr
+TRADED_VALUE_MIN_CR = 10
 
 NSE_HOME  = "https://www.nseindia.com"
 NSE_PAGE  = "https://www.nseindia.com/market-data/stocks-traded"
-NSE_APIS  = [                 # tried in order; first success wins
+NSE_APIS  = [
     "https://www.nseindia.com/api/live-analysis-stocksTraded",
     "https://www.nseindia.com/json/liveAnalysis/stocks-traded.json",
 ]
 
-PAGE_WAIT     = 30            # seconds to wait for page element
-API_SETTLE    = 10            # seconds after page load for XHR to settle
-DOWNLOAD_WAIT = 40            # seconds to wait for CSV file to appear
+PAGE_WAIT     = 30
+API_SETTLE    = 10
+DOWNLOAD_WAIT = 40
 
 EXCHANGE_SFX      = ".NS"
 OUTPUT_DIR        = "NSE_Filtered_Charts"
@@ -113,7 +103,6 @@ STYLE = {
     "recent_low":  "#FFD700",
 }
 
-# Synchronous XHR — runs inside the live browser session (no async timeout)
 SYNC_XHR = """
 var xhr = new XMLHttpRequest();
 xhr.open('GET', arguments[0], false);
@@ -135,24 +124,41 @@ try {
 # ═══════════════════════════════════════════════════════════════
 
 def build_driver(headless: bool, download_dir: str):
+    """
+    Build a Chrome WebDriver.
+    - headless=True  → always used on GitHub Actions / CI
+    - headless=False → visible window for local debugging
+    All CI-required flags (--no-sandbox, --disable-dev-shm-usage, etc.)
+    are always set regardless of headless mode.
+    """
     if not SELENIUM_OK:
-        print("[ERROR] selenium not installed.")
+        print("[ERROR] selenium / webdriver-manager not installed.")
         print("  Fix: pip install selenium webdriver-manager")
         sys.exit(1)
 
     opts = Options()
-    if headless:
-        opts.add_argument("--headless=new")
+
+    # ── Always-on flags (required for CI / Docker / GitHub Actions) ──────
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--disable-extensions")
+    opts.add_argument("--disable-setuid-sandbox")
+    opts.add_argument("--window-size=1920,1080")
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
     opts.add_argument(
         "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
     )
-    opts.add_argument("--window-size=1400,900")
+
+    # ── Headless flag ─────────────────────────────────────────────────────
+    if headless:
+        opts.add_argument("--headless=new")   # Chrome 112+ headless mode
+
+    # ── Download directory ────────────────────────────────────────────────
     opts.add_experimental_option("prefs", {
         "download.default_directory":   download_dir,
         "download.prompt_for_download": False,
@@ -160,15 +166,16 @@ def build_driver(headless: bool, download_dir: str):
         "safebrowsing.enabled":         True,
     })
 
-    if USE_WDM:
-        try:
-            driver = webdriver.Chrome(
-                service=Service(ChromeDriverManager().install()),
-                options=opts)
-            print("  ✔  ChromeDriver ready (webdriver-manager)")
-            return driver
-        except Exception as e:
-            print(f"  [WARN] webdriver-manager: {e}")
+    # ── Try webdriver-manager first, fall back to system ChromeDriver ─────
+    try:
+        driver = webdriver.Chrome(
+            service=Service(ChromeDriverManager().install()),
+            options=opts,
+        )
+        print("  ✔  ChromeDriver ready (webdriver-manager)")
+        return driver
+    except Exception as e:
+        print(f"  [WARN] webdriver-manager failed: {e}")
 
     try:
         driver = webdriver.Chrome(options=opts)
@@ -226,7 +233,6 @@ def warm_session(driver):
 # ═══════════════════════════════════════════════════════════════
 
 def _find_records_in_json(payload) -> list:
-    """Find the stock record list inside any NSE JSON response shape."""
     if isinstance(payload, list) and payload and isinstance(payload[0], dict):
         if any(k in payload[0] for k in ("symbol", "Symbol", "SYMBOL")):
             return payload
@@ -240,7 +246,6 @@ def _find_records_in_json(payload) -> list:
 
 
 def fetch_via_xhr(driver) -> list:
-    """Call confirmed NSE endpoints via sync XHR. Returns raw record list."""
     print("  [3/3]  Calling NSE API via sync XHR …")
     for url in NSE_APIS:
         print(f"         → {url}")
@@ -282,10 +287,12 @@ def _wait_for_csv(dl_dir: str) -> str:
     while time.time() < deadline:
         time.sleep(1)
         print(".", end="", flush=True)
-        files = [f for f in
-                 glob.glob(os.path.join(dl_dir, "*.csv")) +
-                 glob.glob(os.path.join(dl_dir, "*.CSV"))
-                 if not f.endswith(".crdownload")]
+        files = [
+            f for f in
+            glob.glob(os.path.join(dl_dir, "*.csv")) +
+            glob.glob(os.path.join(dl_dir, "*.CSV"))
+            if not f.endswith(".crdownload")
+        ]
         if files:
             latest = max(files, key=os.path.getmtime)
             print(f"\n  ✔  {os.path.basename(latest)}")
@@ -295,7 +302,6 @@ def _wait_for_csv(dl_dir: str) -> str:
 
 
 def fetch_via_csv_button(driver, dl_dir: str) -> str:
-    """Click the CSV download button. Returns path to file or ''."""
     print("  CSV button fallback …")
     xpaths = [
         "//a[contains(@onclick,'StocksTraded-download')]",
@@ -320,7 +326,6 @@ def fetch_via_csv_button(driver, dl_dir: str) -> str:
                         return path
         except Exception:
             continue
-    # Last resort
     try:
         driver.execute_script("downloadCSV('StocksTraded-download');")
         return _wait_for_csv(dl_dir)
@@ -332,17 +337,6 @@ def fetch_via_csv_button(driver, dl_dir: str) -> str:
 # ═══════════════════════════════════════════════════════════════
 #  STEP 1D — NORMALISE TO STANDARD DATAFRAME
 # ═══════════════════════════════════════════════════════════════
-#
-#  Standard internal columns used throughout the pipeline:
-#    Symbol            — NSE ticker
-#    Company           — company name
-#    Series            — EQ / BE / etc
-#    LTP (₹)           — last traded price
-#    % Change          — day % change
-#    Mkt Cap (₹ Cr)    — market cap in Crores
-#    Volume (Lakhs)    — traded volume in Lakhs
-#    Value (₹ Crores)  — traded value in Crores  ← FILTER KEY
-# ═══════════════════════════════════════════════════════════════
 
 def safe_num(v) -> float:
     try:
@@ -353,29 +347,15 @@ def safe_num(v) -> float:
 
 
 def normalise_json(records: list) -> pd.DataFrame:
-    """
-    Convert NSE API JSON records → standard DataFrame.
-
-    Confirmed NSE API field names:
-      symbol            → Symbol
-      series            → Series
-      companyName       → Company
-      lastPrice         → LTP (₹)
-      pChange           → % Change
-      totalTradedVolume → Volume in raw shares  (÷ 1e5 → Lakhs)
-      totalTradedValue  → Traded value in RAW ₹ (÷ 1e7 → Crores)
-    """
     rows = []
     for d in records:
         sym = str(d.get("symbol", d.get("Symbol", ""))).strip()
         if not sym:
             continue
-
         tv_raw = safe_num(d.get("totalTradedValue",
                           d.get("tradedValue", 0)))
         vol    = safe_num(d.get("totalTradedVolume",
                           d.get("tradedQuantity", 0)))
-
         rows.append({
             "Symbol":           sym,
             "Company":          str(d.get("companyName", "")).strip(),
@@ -386,9 +366,8 @@ def normalise_json(records: list) -> pd.DataFrame:
             "Mkt Cap (₹ Cr)":   round(safe_num(d.get("marketCap",
                                      d.get("market_cap", 0))), 2),
             "Volume (Lakhs)":   round(vol / 1e5, 2),
-            "Value (₹ Crores)": round(tv_raw / 1e7, 2),  # raw ₹ → Crores
+            "Value (₹ Crores)": round(tv_raw / 1e7, 2),
         })
-
     df = pd.DataFrame(rows)
     if not df.empty:
         df.sort_values("Value (₹ Crores)", ascending=False, inplace=True)
@@ -398,18 +377,6 @@ def normalise_json(records: list) -> pd.DataFrame:
 
 
 def normalise_csv(path: str) -> pd.DataFrame:
-    """
-    Parse the NSE-downloaded CSV with exact column mapping.
-
-    Confirmed NSE CSV headers (from live download):
-      Symbol | Series | LTP | %chng | Mkt Cap (₹ Crores)
-      | Volume (Lakhs) | Value (₹ Crores)
-
-    KEY FIX: "Value (₹ Crores)" is already in Crores — use directly.
-             "Volume (Lakhs)"   is already in Lakhs  — use directly.
-             Old code searched for "value" AND "trad" in col name →
-             missed "Value (₹ Crores)" (no "trad") → all zeros.
-    """
     try:
         df = pd.read_csv(path, thousands=",")
     except Exception as e:
@@ -421,7 +388,6 @@ def normalise_csv(path: str) -> pd.DataFrame:
     if not df.empty:
         print(f"  First row:   {df.iloc[0].to_dict()}")
 
-    # ── Column mapping — case/space insensitive ────────────────────────────
     col_map = {}
     for col in df.columns:
         cl = col.lower().strip()
@@ -431,15 +397,14 @@ def normalise_csv(path: str) -> pd.DataFrame:
             col_map[col] = "Series"
         elif cl in ("ltp", "last price", "close", "lastprice"):
             col_map[col] = "LTP (₹)"
-        elif cl in ("%chng", "%change", "% change", "pchange", "% chng",
-                    "per change", "%chg"):
+        elif cl in ("%chng", "%change", "% change", "pchange",
+                    "% chng", "per change", "%chg"):
             col_map[col] = "% Change"
         elif "mkt cap" in cl or "market cap" in cl:
             col_map[col] = "Mkt Cap (₹ Cr)"
         elif "volume" in cl:
             col_map[col] = "Volume (Lakhs)"
         elif "value" in cl:
-            # THE KEY FIX — NSE names this "Value (₹ Crores)", not "Traded Value"
             col_map[col] = "Value (₹ Crores)"
         elif "company" in cl or cl == "name":
             col_map[col] = "Company"
@@ -447,7 +412,6 @@ def normalise_csv(path: str) -> pd.DataFrame:
     df.rename(columns=col_map, inplace=True)
     print(f"  Mapped to:   {list(df.columns)}")
 
-    # ── Numeric coercion ──────────────────────────────────────────────────
     for col in ["LTP (₹)", "% Change", "Mkt Cap (₹ Cr)",
                 "Volume (Lakhs)", "Value (₹ Crores)"]:
         if col in df.columns:
@@ -458,20 +422,16 @@ def normalise_csv(path: str) -> pd.DataFrame:
                 errors="coerce"
             ).fillna(0)
 
-    # Add missing columns with defaults
     for col, default in [("Company", ""), ("Series", "EQ"),
                          ("Mkt Cap (₹ Cr)", 0.0)]:
         if col not in df.columns:
             df[col] = default
 
-    # Sort by Value descending
     if "Value (₹ Crores)" in df.columns:
         df.sort_values("Value (₹ Crores)", ascending=False, inplace=True)
-
-        # Sanity check
         top = df["Value (₹ Crores)"].iloc[0]
         print(f"  Top Value (₹ Crores): {top:,.2f}  "
-              f"({'✔ looks correct' if top > 10 else '⚠ suspiciously low — check column mapping'})")
+              f"({'✔ looks correct' if top > 10 else '⚠ suspiciously low'})")
 
     df.reset_index(drop=True, inplace=True)
     df.index += 1
@@ -484,13 +444,7 @@ def normalise_csv(path: str) -> pd.DataFrame:
 # ═══════════════════════════════════════════════════════════════
 
 def download_nse_data(headless: bool, from_csv: str) -> pd.DataFrame:
-    """
-    Returns a standard DataFrame with these columns:
-      Symbol | Company | Series | LTP (₹) | % Change |
-      Mkt Cap (₹ Cr) | Volume (Lakhs) | Value (₹ Crores)
-    """
-
-    # ── Manual CSV mode ───────────────────────────────────────────────────
+    # ── Manual CSV mode ───────────────────────────────────────
     if from_csv:
         print(f"\n  Loading manual CSV: {from_csv}")
         df = normalise_csv(from_csv)
@@ -499,9 +453,10 @@ def download_nse_data(headless: bool, from_csv: str) -> pd.DataFrame:
             sys.exit(1)
         return df
 
-    # ── Automated browser mode ────────────────────────────────────────────
+    # ── Automated browser mode ────────────────────────────────
     if not SELENIUM_OK:
-        print("[ERROR] selenium not installed."); sys.exit(1)
+        print("[ERROR] selenium not installed.")
+        sys.exit(1)
 
     dl_dir = tempfile.mkdtemp()
     driver = build_driver(headless, dl_dir)
@@ -512,14 +467,12 @@ def download_nse_data(headless: bool, from_csv: str) -> pd.DataFrame:
     try:
         warm_session(driver)
 
-        # Method 1: XHR (preferred — includes more fields)
         records = fetch_via_xhr(driver)
         if records:
             df = normalise_json(records)
 
-        # Method 2: CSV button (only if XHR gave nothing)
         if df.empty:
-            print("\n  XHR returned no data — trying CSV download button …")
+            print("\n  XHR returned no data — trying CSV button …")
             csv_path = fetch_via_csv_button(driver, dl_dir)
             if csv_path:
                 df = normalise_csv(csv_path)
@@ -533,10 +486,10 @@ def download_nse_data(headless: bool, from_csv: str) -> pd.DataFrame:
 
     if df.empty:
         print("\n  ✗  Could not retrieve data from NSE.")
-        print("  MANUAL FALLBACK:")
+        print(f"  MANUAL FALLBACK:")
         print(f"  1. Open {NSE_PAGE} in Chrome")
-        print("  2. Click the ↓ CSV button on the page")
-        print("  3. Run:  python nse_pipeline.py --from-csv StocksTraded.csv")
+        print("  2. Click the ↓ CSV button")
+        print("  3. Run: python MC_10Cr_Above_D.py --from-csv StocksTraded.csv")
         sys.exit(1)
 
     return df
@@ -547,9 +500,6 @@ def download_nse_data(headless: bool, from_csv: str) -> pd.DataFrame:
 # ═══════════════════════════════════════════════════════════════
 
 def filter_stocks(df: pd.DataFrame) -> pd.DataFrame:
-    """Keep EQ-series stocks with Value (₹ Crores) > threshold."""
-
-    # Sanity preview before filtering
     print(f"\n  Top 5 by Value before filter:")
     top5 = df[df["Value (₹ Crores)"] > 0].nlargest(5, "Value (₹ Crores)")
     for _, r in top5.iterrows():
@@ -610,7 +560,6 @@ def plot_chart(symbol: str, ohlc: pd.DataFrame,
             spine.set_edgecolor(s["border"])
         ax.grid(True, color=s["grid"], linewidth=0.4, alpha=0.6)
 
-    # ── Candlesticks ─────────────────────────────────────────────────────
     for i, (_, row) in enumerate(ohlc.iterrows()):
         o, h, l, c = row["Open"], row["High"], row["Low"], row["Close"]
         up = c >= o
@@ -619,11 +568,9 @@ def plot_chart(symbol: str, ohlc: pd.DataFrame,
         ax1.bar(i, abs(c - o), bottom=min(o, c), width=CANDLE_BODY_WIDTH,
                 color=s["up_candle" if up else "down_candle"], zorder=3)
 
-    # ── EMA ──────────────────────────────────────────────────────────────
     ax1.plot(xs, ema9.values, color=s["ema_color"],
              linewidth=1.6, label=f"EMA {EMA_PERIOD}", zorder=4)
 
-    # ── Recent-low dashed line ────────────────────────────────────────────
     ax1.hlines(recent_low_price, n - lookback, n - 0.5,
                colors=s["recent_low"], linewidths=1.2,
                linestyles="--", zorder=5)
@@ -640,7 +587,6 @@ def plot_chart(symbol: str, ohlc: pd.DataFrame,
                   edgecolor=s["recent_low"], alpha=0.85, linewidth=0.8),
     )
 
-    # ── Axes ──────────────────────────────────────────────────────────────
     ax1.set_xlim(-1, n + 1)
     pad = (ohlc["High"].max() - ohlc["Low"].min()) * 0.04
     ax1.set_ylim(ohlc["Low"].min() - pad, ohlc["High"].max() + pad)
@@ -648,7 +594,6 @@ def plot_chart(symbol: str, ohlc: pd.DataFrame,
     ax1.yaxis.set_label_position("right")
     ax1.yaxis.tick_right()
 
-    # ── Legend ────────────────────────────────────────────────────────────
     leg = [
         mpatches.Patch(facecolor=s["up_candle"],   label="Bullish"),
         mpatches.Patch(facecolor=s["down_candle"], label="Bearish"),
@@ -661,7 +606,6 @@ def plot_chart(symbol: str, ohlc: pd.DataFrame,
                framealpha=0.6, facecolor=s["bg"],
                edgecolor=s["border"], labelcolor=s["text"])
 
-    # ── Price pills on right axis ─────────────────────────────────────────
     lc = ohlc["Close"].iloc[-1]
     le = ema9.iloc[-1]
     cc = s["up_candle"] if lc >= ohlc["Open"].iloc[-1] else s["down_candle"]
@@ -675,10 +619,9 @@ def plot_chart(symbol: str, ohlc: pd.DataFrame,
                      bbox=dict(boxstyle="round,pad=0.3", facecolor=col,
                                edgecolor="none", alpha=0.95))
 
-    # ── MACD ──────────────────────────────────────────────────────────────
     hcols = [s["hist_up"] if v >= 0 else s["hist_down"] for v in hist.values]
-    ax2.bar(xs, hist.values,    color=hcols, alpha=0.8, width=0.7, zorder=2,
-            label="Histogram")
+    ax2.bar(xs, hist.values,    color=hcols, alpha=0.8, width=0.7,
+            zorder=2, label="Histogram")
     ax2.plot(xs, macd_l.values, color=s["macd_line"],   linewidth=1.3,
              label="MACD",   zorder=3)
     ax2.plot(xs, sig.values,    color=s["signal_line"], linewidth=1.1,
@@ -691,7 +634,6 @@ def plot_chart(symbol: str, ohlc: pd.DataFrame,
                facecolor=s["bg"], edgecolor=s["border"],
                labelcolor=s["text"])
 
-    # ── X-axis date labels ────────────────────────────────────────────────
     step = max(n // 12, 1)
     ax2.set_xticks(xs[::step])
     ax2.set_xticklabels(
@@ -699,7 +641,6 @@ def plot_chart(symbol: str, ohlc: pd.DataFrame,
         rotation=30, ha="right", fontsize=7.5, color=s["subtext"])
     plt.setp(ax1.get_xticklabels(), visible=False)
 
-    # ── Title block ───────────────────────────────────────────────────────
     lc0  = ohlc["Close"].iloc[0]
     pct  = (lc - lc0) / lc0 * 100
     sign = "+" if pct >= 0 else ""
@@ -725,7 +666,6 @@ def plot_chart(symbol: str, ohlc: pd.DataFrame,
 
 
 def generate_charts(filtered_df: pd.DataFrame):
-    """Download daily OHLC from yfinance and save PNG for each stock."""
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     end_date   = datetime.datetime.today() + timedelta(days=1)
     start_date = end_date - timedelta(days=PERIOD_DAYS + 1)
@@ -733,10 +673,16 @@ def generate_charts(filtered_df: pd.DataFrame):
     total = len(filtered_df)
 
     for idx, row in enumerate(filtered_df.itertuples(), 1):
-        sym    = row.Symbol
-        tv_cr  = row._asdict().get("Value (₹ Crores)", 0)
-        ticker = sym if sym.endswith(EXCHANGE_SFX) else sym + EXCHANGE_SFX
+        sym   = row.Symbol
+        tv_cr = getattr(row, "Value_₹_Crores",
+                getattr(row, "_7", 0))   # itertuples sanitises column names
+        # Safer: pull directly from DataFrame by position
+        try:
+            tv_cr = filtered_df.iloc[idx - 1]["Value (₹ Crores)"]
+        except Exception:
+            tv_cr = 0.0
 
+        ticker = sym if sym.endswith(EXCHANGE_SFX) else sym + EXCHANGE_SFX
         print(f"  [{idx:>4}/{total}]  {ticker:<22} "
               f"Value: ₹{tv_cr:>8,.1f} Cr", end="  ", flush=True)
         try:
@@ -746,7 +692,6 @@ def generate_charts(filtered_df: pd.DataFrame):
                 end=end_date.strftime("%Y-%m-%d"),
                 interval="1d", auto_adjust=True, progress=False,
             )
-
             if ohlc.empty or len(ohlc) < MACD_SLOW + MACD_SIGNAL + 5:
                 print(f"✗  Insufficient data ({len(ohlc)} rows)")
                 failed.append(sym)
@@ -779,11 +724,19 @@ def main():
     parser = argparse.ArgumentParser(
         description="NSE Stocks Traded → Filter → Chart Generator"
     )
-    parser.add_argument("--headless", action="store_true",
-                        help="Run Chrome without a visible window")
-    parser.add_argument("--from-csv", metavar="FILE",
-                        help="Skip browser — parse a manually downloaded NSE CSV")
+    # Default on CI: headless. Pass --visible to see the browser locally.
+    parser.add_argument(
+        "--visible", action="store_true",
+        help="Run Chrome with a visible window (local debug only)",
+    )
+    parser.add_argument(
+        "--from-csv", metavar="FILE",
+        help="Skip browser — parse a manually downloaded NSE CSV",
+    )
     args = parser.parse_args()
+
+    # Headless unless --visible is explicitly passed
+    headless = not args.visible
 
     run_time = datetime.datetime.now().strftime("%d %b %Y  %H:%M:%S")
     print(f"\n{'═'*65}")
@@ -793,19 +746,19 @@ def main():
     print(f"  Step 3 : Charts  →  {OUTPUT_DIR}/")
     print(f"{'═'*65}")
 
-    # ── STEP 1: Download ──────────────────────────────────────────────────
+    # STEP 1
     print(f"\n{'─'*65}")
     print("  STEP 1  —  NSE data download")
     print(f"{'─'*65}")
     all_df = download_nse_data(
-        headless=args.headless,
+        headless=headless,
         from_csv=getattr(args, "from_csv", None),
     )
     print(f"\n  Total records : {len(all_df)}")
     all_df.to_csv("nse_all_stocks.csv", index=False)
     print(f"  Saved         : nse_all_stocks.csv")
 
-    # ── STEP 2: Filter ────────────────────────────────────────────────────
+    # STEP 2
     print(f"\n{'─'*65}")
     print(f"  STEP 2  —  Filter: Value > ₹{TRADED_VALUE_MIN_CR} Cr  (EQ only)")
     print(f"{'─'*65}")
@@ -814,10 +767,9 @@ def main():
 
     if filtered.empty:
         print("\n  ⚠  No stocks passed the filter.")
-        print("     Inspect nse_all_stocks.csv — check 'Value (₹ Crores)' column.")
+        print("     Inspect nse_all_stocks.csv — check 'Value (₹ Crores)'.")
         sys.exit(0)
 
-    # Console table
     print(f"\n  {'#':>4}  {'Symbol':<12} {'Company':<28} "
           f"{'LTP':>8}  {'Value (Cr)':>11}  {'%Chg':>7}")
     print(f"  {'─'*78}")
@@ -833,17 +785,17 @@ def main():
     filtered.to_csv("nse_filtered_stocks.csv", index=False)
     print(f"\n  Saved : nse_filtered_stocks.csv  ({len(filtered)} stocks)")
 
-    # ── STEP 3: Charts ────────────────────────────────────────────────────
+    # STEP 3
     print(f"\n{'─'*65}")
     print(f"  STEP 3  —  Generating charts  →  {OUTPUT_DIR}/")
     print(f"{'─'*65}")
     success, failed = generate_charts(filtered)
 
-    # ── Summary ───────────────────────────────────────────────────────────
     print(f"\n{'═'*65}")
     print(f"  PIPELINE COMPLETE  —  {run_time}")
     print(f"  NSE records     : {len(all_df)}")
-    print(f"  After filter    : {len(filtered)}  (Value > ₹{TRADED_VALUE_MIN_CR} Cr)")
+    print(f"  After filter    : {len(filtered)}  "
+          f"(Value > ₹{TRADED_VALUE_MIN_CR} Cr)")
     print(f"  Charts saved    : {len(success)}  →  {OUTPUT_DIR}/")
     if failed:
         print(f"  Charts failed   : {len(failed)}: "
