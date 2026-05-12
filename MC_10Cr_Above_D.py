@@ -6,13 +6,19 @@ STEP 2 — Filter EQ-series stocks where Value > ₹10 Crores
 STEP 3 — Download 250 daily bars from yfinance and save
           TradingView-style dark-theme PNG charts
 
+NEW in this version:
+  • EMA9 on Weekly close — plotted on the daily chart (purple dashed line)
+  • EMA9 on Monthly close — plotted on the daily chart (cyan dotted line)
+  Both are computed on their native timeframe and forward-filled onto the
+  daily bar index so they step-hold correctly between HTF closes.
+
 Requirements:
     pip install selenium webdriver-manager yfinance pandas openpyxl matplotlib
 
 Usage:
-    python MC_10Cr_Above_D.py                   # headless (CI / GitHub Actions)
-    python MC_10Cr_Above_D.py --visible         # visible browser (local debug)
-    python MC_10Cr_Above_D.py --from-csv FILE   # skip browser
+    python nse_pipeline.py                      # headless (CI / GitHub Actions)
+    python nse_pipeline.py --visible            # visible browser (local debug)
+    python nse_pipeline.py --from-csv FILE      # skip browser
 """
 
 import sys
@@ -84,6 +90,12 @@ RECENT_LOW_BARS   = 20
 CANDLE_BODY_WIDTH = 0.75
 CANDLE_WICK_WIDTH = 0.12
 
+# ── HTF EMA9 overlay settings ────────────────────────────────
+WEEKLY_LOOKBACK_DAYS  = 730    # ~2 years to warm up weekly EMA9
+MONTHLY_LOOKBACK_DAYS = 3650   # ~10 years to warm up monthly EMA9
+WEEKLY_EMA_COLOR      = "#E040FB"   # bright purple  (dashed)
+MONTHLY_EMA_COLOR     = "#00E5FF"   # bright cyan    (dotted)
+
 STYLE = {
     "bg":          "#131722",
     "panel_bg":    "#1E222D",
@@ -124,21 +136,12 @@ try {
 # ═══════════════════════════════════════════════════════════════
 
 def build_driver(headless: bool, download_dir: str):
-    """
-    Build a Chrome WebDriver.
-    - headless=True  → always used on GitHub Actions / CI
-    - headless=False → visible window for local debugging
-    All CI-required flags (--no-sandbox, --disable-dev-shm-usage, etc.)
-    are always set regardless of headless mode.
-    """
     if not SELENIUM_OK:
         print("[ERROR] selenium / webdriver-manager not installed.")
         print("  Fix: pip install selenium webdriver-manager")
         sys.exit(1)
 
     opts = Options()
-
-    # ── Always-on flags (required for CI / Docker / GitHub Actions) ──────
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
@@ -153,12 +156,9 @@ def build_driver(headless: bool, download_dir: str):
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     )
-
-    # ── Headless flag ─────────────────────────────────────────────────────
     if headless:
-        opts.add_argument("--headless=new")   # Chrome 112+ headless mode
+        opts.add_argument("--headless=new")
 
-    # ── Download directory ────────────────────────────────────────────────
     opts.add_experimental_option("prefs", {
         "download.default_directory":   download_dir,
         "download.prompt_for_download": False,
@@ -166,7 +166,6 @@ def build_driver(headless: bool, download_dir: str):
         "safebrowsing.enabled":         True,
     })
 
-    # ── Try webdriver-manager first, fall back to system ChromeDriver ─────
     try:
         driver = webdriver.Chrome(
             service=Service(ChromeDriverManager().install()),
@@ -183,13 +182,10 @@ def build_driver(headless: bool, download_dir: str):
         return driver
     except Exception as e:
         print(f"\n[ERROR] Chrome unavailable: {e}")
-        print("  1. Install Chrome: https://www.google.com/chrome/")
-        print("  2. pip install --upgrade selenium webdriver-manager")
         sys.exit(1)
 
 
 def patch_driver(driver):
-    """Hide Selenium fingerprint from NSE bot detection."""
     try:
         driver.execute_cdp_cmd(
             "Page.addScriptToEvaluateOnNewDocument",
@@ -201,13 +197,12 @@ def patch_driver(driver):
 
 
 def warm_session(driver):
-    """Load homepage + stocks-traded page to build a full NSE session."""
     print("  [1/3]  Loading NSE homepage …")
     driver.get(NSE_HOME)
     time.sleep(4)
     print(f"         Cookies: {[c['name'] for c in driver.get_cookies()]}")
 
-    print("  [2/3]  Loading Stocks Traded page …")
+    print(f"  [2/3]  Loading Stocks Traded page …")
     driver.get(NSE_PAGE)
     try:
         WebDriverWait(driver, PAGE_WAIT).until(
@@ -444,7 +439,6 @@ def normalise_csv(path: str) -> pd.DataFrame:
 # ═══════════════════════════════════════════════════════════════
 
 def download_nse_data(headless: bool, from_csv: str) -> pd.DataFrame:
-    # ── Manual CSV mode ───────────────────────────────────────
     if from_csv:
         print(f"\n  Loading manual CSV: {from_csv}")
         df = normalise_csv(from_csv)
@@ -453,7 +447,6 @@ def download_nse_data(headless: bool, from_csv: str) -> pd.DataFrame:
             sys.exit(1)
         return df
 
-    # ── Automated browser mode ────────────────────────────────
     if not SELENIUM_OK:
         print("[ERROR] selenium not installed.")
         sys.exit(1)
@@ -466,17 +459,14 @@ def download_nse_data(headless: bool, from_csv: str) -> pd.DataFrame:
 
     try:
         warm_session(driver)
-
         records = fetch_via_xhr(driver)
         if records:
             df = normalise_json(records)
-
         if df.empty:
             print("\n  XHR returned no data — trying CSV button …")
             csv_path = fetch_via_csv_button(driver, dl_dir)
             if csv_path:
                 df = normalise_csv(csv_path)
-
     except WebDriverException as e:
         print(f"\n[ERROR] WebDriver: {e}")
     finally:
@@ -489,7 +479,7 @@ def download_nse_data(headless: bool, from_csv: str) -> pd.DataFrame:
         print(f"  MANUAL FALLBACK:")
         print(f"  1. Open {NSE_PAGE} in Chrome")
         print("  2. Click the ↓ CSV button")
-        print("  3. Run: python MC_10Cr_Above_D.py --from-csv StocksTraded.csv")
+        print("  3. Run: python nse_pipeline.py --from-csv StocksTraded.csv")
         sys.exit(1)
 
     return df
@@ -517,7 +507,7 @@ def filter_stocks(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  STEP 3 — CHART GENERATOR
+#  STEP 3 — INDICATORS
 # ═══════════════════════════════════════════════════════════════
 
 def ema(series, period):
@@ -530,8 +520,85 @@ def macd_calc(close, fast=12, slow=26, signal=9):
     return ml, sl, ml - sl
 
 
+def fetch_htf_ema9(ticker: str, daily_index: pd.DatetimeIndex):
+    """
+    Download weekly and monthly OHLC, compute EMA9 on each timeframe's
+    close, then forward-fill onto the daily index.
+
+    How it works
+    ────────────
+    1. Download 2 years of weekly bars  → compute EMA9 → weekly_ema9
+    2. Download 10 years of monthly bars → compute EMA9 → monthly_ema9
+    3. For each, reindex to the union of (htf dates ∪ daily dates) and
+       forward-fill, so every daily bar carries the latest HTF EMA9 value.
+
+    Returns
+    ───────
+    weekly_ema9_daily  : pd.Series indexed to daily_index
+    monthly_ema9_daily : pd.Series indexed to daily_index
+    """
+    end_dt = datetime.datetime.today() + timedelta(days=1)
+
+    def _download_close(interval, lookback_days):
+        start_dt = end_dt - timedelta(days=lookback_days)
+        try:
+            df = yf.download(
+                ticker,
+                start=start_dt.strftime("%Y-%m-%d"),
+                end=end_dt.strftime("%Y-%m-%d"),
+                interval=interval,
+                auto_adjust=True,
+                progress=False,
+            )
+            if df is None or df.empty:
+                return pd.Series(dtype=float)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            close = df["Close"].dropna()
+            # Strip timezone so index aligns with tz-naive daily index
+            close.index = pd.to_datetime(close.index).tz_localize(None)
+            return close
+        except Exception:
+            return pd.Series(dtype=float)
+
+    weekly_close  = _download_close("1wk", WEEKLY_LOOKBACK_DAYS)
+    monthly_close = _download_close("1mo", MONTHLY_LOOKBACK_DAYS)
+
+    weekly_ema9  = ema(weekly_close,  EMA_PERIOD) if not weekly_close.empty \
+                   else pd.Series(dtype=float)
+    monthly_ema9 = ema(monthly_close, EMA_PERIOD) if not monthly_close.empty \
+                   else pd.Series(dtype=float)
+
+    def _ffill_onto_daily(htf_series: pd.Series) -> pd.Series:
+        """
+        Merge HTF series index with daily_index, forward-fill gaps,
+        then select only the daily dates.
+        """
+        if htf_series.empty:
+            return pd.Series(np.nan, index=daily_index)
+        merged_idx = htf_series.index.union(daily_index).sort_values()
+        filled     = htf_series.reindex(merged_idx).ffill()
+        return filled.reindex(daily_index)
+
+    return _ffill_onto_daily(weekly_ema9), _ffill_onto_daily(monthly_ema9)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  STEP 3 — CHART
+# ═══════════════════════════════════════════════════════════════
+
 def plot_chart(symbol: str, ohlc: pd.DataFrame,
-               tv_cr: float, output_path: str):
+               tv_cr: float, output_path: str,
+               weekly_ema9: pd.Series = None,
+               monthly_ema9: pd.Series = None):
+    """
+    Render a TradingView-style dark chart with:
+      • Candlesticks + EMA9 (daily)
+      • EMA9 on weekly close  — purple dashed line
+      • EMA9 on monthly close — cyan dotted line
+      • 20-bar recent-low dashed annotation
+      • MACD (12, 26, 9)
+    """
     s  = STYLE
     n  = len(ohlc)
     xs = np.arange(n)
@@ -539,6 +606,7 @@ def plot_chart(symbol: str, ohlc: pd.DataFrame,
     ema9              = ema(ohlc["Close"], EMA_PERIOD)
     macd_l, sig, hist = macd_calc(ohlc["Close"])
 
+    # Recent-low calculation
     lookback           = min(RECENT_LOW_BARS, n)
     recent_window      = ohlc["Low"].iloc[-lookback:]
     recent_low_price   = recent_window.min()
@@ -560,6 +628,7 @@ def plot_chart(symbol: str, ohlc: pd.DataFrame,
             spine.set_edgecolor(s["border"])
         ax.grid(True, color=s["grid"], linewidth=0.4, alpha=0.6)
 
+    # ── Candlesticks ──────────────────────────────────────────────────────────
     for i, (_, row) in enumerate(ohlc.iterrows()):
         o, h, l, c = row["Open"], row["High"], row["Low"], row["Close"]
         up = c >= o
@@ -568,21 +637,46 @@ def plot_chart(symbol: str, ohlc: pd.DataFrame,
         ax1.bar(i, abs(c - o), bottom=min(o, c), width=CANDLE_BODY_WIDTH,
                 color=s["up_candle" if up else "down_candle"], zorder=3)
 
+    # ── Daily EMA9 ────────────────────────────────────────────────────────────
     ax1.plot(xs, ema9.values, color=s["ema_color"],
-             linewidth=1.6, label=f"EMA {EMA_PERIOD}", zorder=4)
+             linewidth=1.6, label=f"EMA {EMA_PERIOD} (Daily)", zorder=4)
 
+    # ── Weekly EMA9 forward-filled onto daily bars ────────────────────────────
+    if weekly_ema9 is not None and not weekly_ema9.isna().all():
+        # Align to ohlc's exact index (handles any date-mismatch safely)
+        w_vals = weekly_ema9.reindex(ohlc.index, method="ffill").values
+        ax1.plot(xs, w_vals,
+                 color=WEEKLY_EMA_COLOR,
+                 linewidth=1.5,
+                 linestyle="--",
+                 label=f"EMA {EMA_PERIOD} (Weekly)",
+                 zorder=5,
+                 alpha=0.90)
+
+    # ── Monthly EMA9 forward-filled onto daily bars ───────────────────────────
+    if monthly_ema9 is not None and not monthly_ema9.isna().all():
+        m_vals = monthly_ema9.reindex(ohlc.index, method="ffill").values
+        ax1.plot(xs, m_vals,
+                 color=MONTHLY_EMA_COLOR,
+                 linewidth=1.5,
+                 linestyle=":",
+                 label=f"EMA {EMA_PERIOD} (Monthly)",
+                 zorder=5,
+                 alpha=0.90)
+
+    # ── Recent-low dashed line ────────────────────────────────────────────────
     ax1.hlines(recent_low_price, n - lookback, n - 0.5,
                colors=s["recent_low"], linewidths=1.2,
-               linestyles="--", zorder=5)
+               linestyles="--", zorder=6)
     ax1.plot(recent_low_bar_idx, recent_low_price,
              marker="D", markersize=5, color=s["recent_low"],
-             markeredgecolor=s["bg"], markeredgewidth=0.8, zorder=6)
+             markeredgecolor=s["bg"], markeredgewidth=0.8, zorder=7)
     ax1.annotate(
         f"  {pct_below:.2f}%",
         xy=(n - 1, recent_low_price),
         xytext=(n - 1 + 0.8, recent_low_price),
         color=s["recent_low"], fontsize=7.5, fontweight="bold",
-        va="center", ha="left", zorder=7, annotation_clip=False,
+        va="center", ha="left", zorder=8, annotation_clip=False,
         bbox=dict(boxstyle="round,pad=0.3", facecolor=s["panel_bg"],
                   edgecolor=s["recent_low"], alpha=0.85, linewidth=0.8),
     )
@@ -594,31 +688,51 @@ def plot_chart(symbol: str, ohlc: pd.DataFrame,
     ax1.yaxis.set_label_position("right")
     ax1.yaxis.tick_right()
 
+    # ── Legend ────────────────────────────────────────────────────────────────
     leg = [
         mpatches.Patch(facecolor=s["up_candle"],   label="Bullish"),
         mpatches.Patch(facecolor=s["down_candle"], label="Bearish"),
-        Line2D([0], [0], color=s["ema_color"], linewidth=1.8,
-               label=f"EMA {EMA_PERIOD}"),
-        Line2D([0], [0], color=s["recent_low"], linewidth=1.2,
+        Line2D([0], [0], color=s["ema_color"],      linewidth=1.8,
+               linestyle="-",  label=f"EMA {EMA_PERIOD} (Daily)"),
+        Line2D([0], [0], color=WEEKLY_EMA_COLOR,    linewidth=1.5,
+               linestyle="--", label=f"EMA {EMA_PERIOD} (Weekly)"),
+        Line2D([0], [0], color=MONTHLY_EMA_COLOR,   linewidth=1.5,
+               linestyle=":",  label=f"EMA {EMA_PERIOD} (Monthly)"),
+        Line2D([0], [0], color=s["recent_low"],     linewidth=1.2,
                linestyle="--", label=f"{RECENT_LOW_BARS}-bar Low"),
     ]
-    ax1.legend(handles=leg, loc="upper left", fontsize=8,
+    ax1.legend(handles=leg, loc="upper left", fontsize=7.5,
                framealpha=0.6, facecolor=s["bg"],
                edgecolor=s["border"], labelcolor=s["text"])
 
+    # ── Right-axis price pills ────────────────────────────────────────────────
     lc = ohlc["Close"].iloc[-1]
     le = ema9.iloc[-1]
     cc = s["up_candle"] if lc >= ohlc["Open"].iloc[-1] else s["down_candle"]
-    for val, col, lbl in [(lc, cc, f"₹{lc:,.2f}"),
-                           (le, s["ema_color"], f"₹{le:,.2f}")]:
+    pills = [(lc, cc, f"₹{lc:,.2f}"), (le, s["ema_color"], f"₹{le:,.2f}")]
+
+    # Add weekly / monthly EMA9 pills if available
+    if weekly_ema9 is not None:
+        wv = weekly_ema9.reindex(ohlc.index, method="ffill")
+        if not wv.isna().all():
+            pills.append((wv.iloc[-1], WEEKLY_EMA_COLOR,
+                          f"W {wv.iloc[-1]:,.2f}"))
+    if monthly_ema9 is not None:
+        mv = monthly_ema9.reindex(ohlc.index, method="ffill")
+        if not mv.isna().all():
+            pills.append((mv.iloc[-1], MONTHLY_EMA_COLOR,
+                          f"M {mv.iloc[-1]:,.2f}"))
+
+    for val, col, lbl in pills:
         ax1.annotate(lbl,
                      xy=(1, val), xycoords=("axes fraction", "data"),
                      xytext=(4, 0), textcoords="offset points",
-                     fontsize=8, fontweight="bold", color=s["bg"],
+                     fontsize=7.5, fontweight="bold", color=s["bg"],
                      ha="left", va="center", annotation_clip=False,
                      bbox=dict(boxstyle="round,pad=0.3", facecolor=col,
                                edgecolor="none", alpha=0.95))
 
+    # ── MACD ──────────────────────────────────────────────────────────────────
     hcols = [s["hist_up"] if v >= 0 else s["hist_down"] for v in hist.values]
     ax2.bar(xs, hist.values,    color=hcols, alpha=0.8, width=0.7,
             zorder=2, label="Histogram")
@@ -634,6 +748,7 @@ def plot_chart(symbol: str, ohlc: pd.DataFrame,
                facecolor=s["bg"], edgecolor=s["border"],
                labelcolor=s["text"])
 
+    # ── X-axis date labels ────────────────────────────────────────────────────
     step = max(n // 12, 1)
     ax2.set_xticks(xs[::step])
     ax2.set_xticklabels(
@@ -641,6 +756,7 @@ def plot_chart(symbol: str, ohlc: pd.DataFrame,
         rotation=30, ha="right", fontsize=7.5, color=s["subtext"])
     plt.setp(ax1.get_xticklabels(), visible=False)
 
+    # ── Title block ───────────────────────────────────────────────────────────
     lc0  = ohlc["Close"].iloc[0]
     pct  = (lc - lc0) / lc0 * 100
     sign = "+" if pct >= 0 else ""
@@ -657,13 +773,17 @@ def plot_chart(symbol: str, ohlc: pd.DataFrame,
              color=s["text"], fontsize=9, ha="right", fontweight="bold")
     fig.text(0.96, 0.935,
              f"MACD ({MACD_FAST},{MACD_SLOW},{MACD_SIGNAL})"
-             f"  |  EMA {EMA_PERIOD}  |  Bars: {n}",
+             f"  |  EMA {EMA_PERIOD} Daily/Weekly/Monthly  |  Bars: {n}",
              color=s["subtext"], fontsize=8, ha="right")
 
     plt.savefig(output_path, dpi=150, bbox_inches="tight",
                 facecolor=s["bg"], edgecolor="none")
     plt.close(fig)
 
+
+# ═══════════════════════════════════════════════════════════════
+#  STEP 3 — BATCH CHART GENERATOR
+# ═══════════════════════════════════════════════════════════════
 
 def generate_charts(filtered_df: pd.DataFrame):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -673,10 +793,7 @@ def generate_charts(filtered_df: pd.DataFrame):
     total = len(filtered_df)
 
     for idx, row in enumerate(filtered_df.itertuples(), 1):
-        sym   = row.Symbol
-        tv_cr = getattr(row, "Value_₹_Crores",
-                getattr(row, "_7", 0))   # itertuples sanitises column names
-        # Safer: pull directly from DataFrame by position
+        sym = row.Symbol
         try:
             tv_cr = filtered_df.iloc[idx - 1]["Value (₹ Crores)"]
         except Exception:
@@ -686,6 +803,7 @@ def generate_charts(filtered_df: pd.DataFrame):
         print(f"  [{idx:>4}/{total}]  {ticker:<22} "
               f"Value: ₹{tv_cr:>8,.1f} Cr", end="  ", flush=True)
         try:
+            # ── Daily OHLC ────────────────────────────────────────────────────
             ohlc = yf.download(
                 ticker,
                 start=start_date.strftime("%Y-%m-%d"),
@@ -700,11 +818,16 @@ def generate_charts(filtered_df: pd.DataFrame):
             if isinstance(ohlc.columns, pd.MultiIndex):
                 ohlc.columns = ohlc.columns.get_level_values(0)
             ohlc = ohlc[["Open", "High", "Low", "Close", "Volume"]].dropna()
-            ohlc.index = pd.to_datetime(ohlc.index)
+            ohlc.index = pd.to_datetime(ohlc.index).tz_localize(None)
             ohlc = ohlc.tail(250)
 
+            # ── Weekly + Monthly EMA9 (forward-filled onto daily index) ───────
+            w_ema9, m_ema9 = fetch_htf_ema9(ticker, ohlc.index)
+
             out = os.path.join(OUTPUT_DIR, f"{sym}.png")
-            plot_chart(sym, ohlc, tv_cr, out)
+            plot_chart(sym, ohlc, tv_cr, out,
+                       weekly_ema9=w_ema9,
+                       monthly_ema9=m_ema9)
             print(f"✔  {len(ohlc)} bars  →  {out}")
             success.append(sym)
 
@@ -724,7 +847,6 @@ def main():
     parser = argparse.ArgumentParser(
         description="NSE Stocks Traded → Filter → Chart Generator"
     )
-    # Default on CI: headless. Pass --visible to see the browser locally.
     parser.add_argument(
         "--visible", action="store_true",
         help="Run Chrome with a visible window (local debug only)",
@@ -734,8 +856,6 @@ def main():
         help="Skip browser — parse a manually downloaded NSE CSV",
     )
     args = parser.parse_args()
-
-    # Headless unless --visible is explicitly passed
     headless = not args.visible
 
     run_time = datetime.datetime.now().strftime("%d %b %Y  %H:%M:%S")
@@ -743,7 +863,7 @@ def main():
     print(f"  NSE Pipeline  —  {run_time}")
     print(f"  Step 1 : Download NSE Stocks Traded")
     print(f"  Step 2 : Filter  Value > ₹{TRADED_VALUE_MIN_CR} Cr  (EQ series)")
-    print(f"  Step 3 : Charts  →  {OUTPUT_DIR}/")
+    print(f"  Step 3 : Charts  (Daily + Weekly EMA9 + Monthly EMA9)  →  {OUTPUT_DIR}/")
     print(f"{'═'*65}")
 
     # STEP 1
