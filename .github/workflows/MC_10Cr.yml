@@ -15,11 +15,9 @@ jobs:
         uses: actions/checkout@v4.2.2
 
       - name: Install Chrome
-        run: |
-          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
-          echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
-          sudo apt-get update -q
-          sudo apt-get install -y google-chrome-stable
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
 
       - name: Set up Python
         uses: actions/setup-python@v5.4.0
@@ -30,18 +28,18 @@ jobs:
         run: pip install yfinance pandas openpyxl matplotlib selenium webdriver-manager
 
       - name: Run chart generator
-        run: python MC_10Cr_Above_D.py
+        run: python YF_D_TO_10Cr.py
 
       - name: Check charts output
         run: |
           echo "=== Current directory ==="
           ls -la
           echo "=== Charts folder ==="
-          ls -la NSE_Filtered_Charts/ || echo "NSE_Filtered_Charts/ folder does not exist!"
+          ls -la YF_D_TO_10Cr/ || echo "YF_D_TO_10Cr/ folder does not exist!"
 
       - name: Zip charts folder
         run: |
-          FOLDER="NSE_Filtered_Charts"
+          FOLDER="YF_D_TO_10Cr"
           if [ -d "$FOLDER" ] && [ "$(ls -A $FOLDER)" ]; then
             cd "$FOLDER"
             ZIP_NAME="charts_NSE_10Cr_$(date +'%Y-%m-%d').zip"
